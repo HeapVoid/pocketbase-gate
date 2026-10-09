@@ -53,6 +53,33 @@ class NativePocketBaseTests(unittest.TestCase):
         code, report = self.run_gate(checks)
         self.assertEqual(code, 0, report)
         self.assertTrue(all(not item['metrics']['fixture']['reused'] for item in report['checks']))
+        self.assertEqual([item['metrics']['fixture']['baseline']['hit'] for item in report['checks']], [False,True])
+
+    def test_stopped_baseline_is_reused_verified_and_invalidated(self):
+        checks = [self.check('baseline', "assert.equal((await context.request('/api/collections/notes/records')).totalItems,0);", cache=False)]
+        first_code, first = self.run_gate(checks)
+        self.assertEqual(first_code,0,first)
+        _, second = self.run_gate(checks)
+        self.assertTrue(second['checks'][0]['metrics']['fixture']['baseline']['hit'])
+        key = second['checks'][0]['metrics']['fixture']['baseline']['key']
+        database = self.root / '.pbgate/cache' / key / 'data/data.db'
+        with database.open('ab') as output:
+            output.write(b'corrupted')
+        code, restored = self.run_gate(checks)
+        self.assertEqual(code,0,restored)
+        self.assertFalse(restored['checks'][0]['metrics']['fixture']['baseline']['hit'])
+        with (self.root / 'migrations/1000000000_notes.js').open('a') as output:
+            output.write('\n// Changed migration input\n')
+        code, changed = self.run_gate(checks)
+        self.assertEqual(code,0,changed)
+        self.assertNotEqual(key,changed['checks'][0]['metrics']['fixture']['baseline']['key'])
+
+    def test_first_boot_scenarios_can_disable_prepared_baselines(self):
+        checks = [self.check('firstboot','assert.ok(true);',cache=False)]
+        for _ in range(2):
+            code, report = self.run_gate(checks, {'baseline':False})
+            self.assertEqual(code,0,report)
+            self.assertIsNone(report['checks'][0]['metrics']['fixture']['baseline']['key'])
 
     def test_schema_mutation_rejects_shared_success(self):
         checks = [self.check('mutate', "const collection=await context.request('/api/collections/notes'); await context.request('/api/collections/'+collection.id,{method:'DELETE'});", isolation='shared')]
@@ -87,3 +114,52 @@ class NativePocketBaseTests(unittest.TestCase):
         code, report = self.run_gate(checks, {'seed':['node','seed.mjs']})
         self.assertEqual(code, 124, report)
         self.assertFalse(list((self.root / '.pbgate').glob('run-*')))
+
+    @unittest.skipUnless(BIMBA and Path(BIMBA).is_dir(), 'Set PBGATE_TEST_BIMBA to installed bimba-cli')
+    def test_independent_callback_edits_preserve_exact_test_and_schema_proofs(self):
+        import shutil
+        (self.root / 'src').mkdir()
+        package = self.root / 'node_modules/pocketbase-gate'
+        package.mkdir(parents=True)
+        shutil.copyfile(ROOT / 'src/context.js',package / 'context.js')
+        (package / 'package.json').write_text('{"type":"module","exports":"./context.js"}')
+        (self.root / 'node_modules/bimba-cli').symlink_to(BIMBA)
+        (self.root / 'package.json').write_text('{"type":"module"}')
+        source = 'routerAdd "GET", "/api/alpha", do(e)\n\te.json(200, {value: $app.store().get("override") || "alpha"})\nrouterAdd "GET", "/api/beta", do(e)\n\te.json(200, {value: "VALUE"})\n'
+        untracked = self.root / 'src/untracked.imba'
+        untracked.write_text('export default {value: "alpha"}\n')
+        hooks = self.root / 'src/api.pb.imba'
+        hooks.write_text(source.replace('VALUE','before'))
+        (self.root / 'compile.mjs').write_text("import {compileHooks} from '" + (ROOT / 'src/imba.js').as_uri() + "'; await compileHooks();")
+        compile_check = dict(id='compile',kind='prepare',command=['bun','compile.mjs'],inputs=['src','compile.mjs'],outputs=['public'])
+        alpha = self.check('alpha',"assert.equal((await context.request('/api/alpha')).value,'alpha');",requires=['compile'],dependencies={'routes':['/api/alpha']})
+        (self.root / 'alpha.mjs').write_text((self.root / 'alpha.mjs').read_text().replace(CONTEXT,'pocketbase-gate'))
+        beta = self.check('beta',"assert.ok((await context.request('/api/beta')).value);",requires=['compile'],dependencies={'routes':['/api/beta']},cache=False)
+        (self.root / 'beta.mjs').write_text((self.root / 'beta.mjs').read_text().replace(CONTEXT,'pocketbase-gate'))
+        fixture = {'hooks':'public','baseline':'schema'}
+        code, first = self.run_gate([compile_check,alpha,beta],fixture)
+        self.assertEqual(code,0,first)
+        key = next(item for item in first['checks'] if item['id']=='beta')['metrics']['fixture']['baseline']['key']
+        hooks.write_text(source.replace('VALUE','after'))
+        code, second = self.run_gate([compile_check,alpha,beta],fixture)
+        self.assertEqual(code,0,second)
+        by_id = {item['id']:item for item in second['checks']}
+        self.assertTrue(by_id['alpha']['cached'],second)
+        self.assertEqual(key,by_id['beta']['metrics']['fixture']['baseline']['key'])
+        self.assertTrue(by_id['beta']['metrics']['fixture']['baseline']['hit'])
+        # A maintained hook outside the compiler graph can load any module.
+        external = self.root / 'public/external.pb.js'
+        external.write_text('onBootstrap(function(e) {e.next(); $app.store().set("override", require(__hooks+"/untracked.js").value);});')
+        code, extended = self.run_gate([compile_check,alpha],fixture)
+        self.assertEqual(code,0,extended)
+        untracked.write_text('export default {value: "changed"}\n')
+        code, unregistered = self.run_gate([compile_check,alpha],fixture)
+        self.assertFalse(next(item for item in unregistered['checks'] if item['id']=='alpha')['cached'],unregistered)
+        self.assertNotEqual(code,0,unregistered)
+        external.unlink()
+        # Unknown/dynamic reads invalidate the narrow proof and execute fresh.
+        with (self.root / 'alpha.mjs').open('a') as output:
+            output.write("\nimport {readFileSync} from 'node:fs'; if(process.env.UNUSED_INPUT) readFileSync(process.env.UNUSED_INPUT);\n")
+        code, third = self.run_gate([compile_check,alpha],fixture)
+        self.assertEqual(code,0,third)
+        self.assertFalse(third['checks'][-1]['cached'])

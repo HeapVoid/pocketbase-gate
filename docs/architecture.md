@@ -8,13 +8,17 @@ The shared scheduler consumes normalized checks. It has no names of business col
 
 The process guard is retained from the existing verification owner. Each group waits for confirmed registration before executing. A pipe lease plus parent-exit kernel events trigger cleanup if the supervisor or its host disappears. The guard inherits the machine lock and releases it after owned process/data cleanup.
 
-Initial scope includes arbitrary argv checks, dependency planning, conservative content receipts, generated artifact restoration, two resource profiles, timeouts, failure recovery, fresh/shared PocketBase fixtures and Bimba hook compilation. Native regression tests exercise a separate project with its own schema and Imba sources.
+`DependencyGraph` validates compiler source membership, source/output hashes and the analyzer identity. Complete static test descriptors follow all branches, imports and literal reads; unknown operations retain broad invalidation. Inline route callbacks have separate hashes from startup/record hooks so unrelated endpoint edits do not invalidate a selected route or prepared schema. A preparation prerequisite binds its recipe and relevant outputs instead of imposing unrelated source changes on a precise test.
+
+`ReceiptCache` also owns stopped database artifacts, their complete inventories, private metadata, atomic publication and the shared eviction budget. `PocketBasePool` supplies the bootstrap scope and reconstructs a separate runtime from a stopped baseline. First-boot tests disable baseline reuse; seed actions always run fresh. Bootstrap-sensitive time is bound to the UTC date.
+
+Process ownership uses both registered groups and inherited random markers. The guard tracks detached descendants and keeps the machine lease through cleanup after supervisor/host loss. Gate commands disable Bimba's persistent typecheck daemon and inherit the selected OS scheduling priority.
+
+Native regression tests exercise a separate project with its own schema and Imba sources, including partial invalidation, baseline corruption, schema isolation and shared record/storage/store restoration.
 
 Further extraction should preserve the existing dependency/fixture contracts while adding:
 
-1. Complete compiler dependency descriptors to narrow source invalidation safely; unavailable or opaque descriptors retain the broad scope.
-2. Prepared stopped baseline caching for fresh fixtures, keyed by every bootstrap dependency and relevant time input.
-3. Measured scheduling priorities from historical failure, fixture preparation and execution cost.
-4. Migration of Questfall's catalogs and helpers to this package, followed by removal of superseded copied executors.
+1. Measured scheduling priorities from historical failure, fixture preparation and execution cost.
+2. Migration of Questfall's catalogs and helpers to this package, followed by removal of superseded copied executors.
 
-Questfall's current gate remains independent during its parallel backend work. The package is not yet its authoritative release runner. npm publication and consumer migration are separate steps from creating this repository.
+Questfall's current gate remains independent during its parallel backend work. The package is not yet its authoritative release runner. Consumer migration must preserve its catalog coverage, lifecycle workers and release policy.

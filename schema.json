@@ -157,6 +157,38 @@
             "additionalProperties": {
               "type": "string"
             }
+          },
+          "dependencies": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "mode": {
+                "enum": [
+                  "routes",
+                  "models"
+                ],
+                "default": "routes"
+              },
+              "outdir": {
+                "type": "string",
+                "minLength": 1,
+                "default": "public"
+              },
+              "routes": {
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "minLength": 1
+                }
+              },
+              "roots": {
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "minLength": 1
+                }
+              }
+            }
           }
         }
       }
@@ -217,6 +249,14 @@
             "type": "integer",
             "minimum": 1,
             "maximum": 64
+          },
+          "baseline": {
+            "enum": [
+              "initial",
+              "schema",
+              false
+            ],
+            "default": "initial"
           }
         }
       }

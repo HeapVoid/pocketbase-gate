@@ -2,6 +2,7 @@
 import json
 import os
 from pathlib import Path
+import platform
 import secrets
 import shutil
 import socket
@@ -9,12 +10,15 @@ import subprocess
 import time
 import urllib.error
 import urllib.request
+from datetime import datetime, timezone
+from dependencies import digest
 
 
 class PocketBaseFixture:
-    def __init__(self, project, session, name):
+    def __init__(self, project, session, name, dependencies=None):
         self.project, self.session, self.name = project, session, name
         self.definition = project.fixtures[name]
+        self.dependencies = dependencies
         self.directory = session.directory / ('fixture-' + secrets.token_hex(8))
         self.directory.mkdir()
         self.owner = secrets.token_hex(24)
@@ -23,6 +27,23 @@ class PocketBaseFixture:
         self.output = None
         self.token = None
         self.used = 0
+
+    def baseline_key(self):
+        content, root, definition = self.session.content, self.project.root, self.definition
+        hooks = definition.get('hooks')
+        environment = self.session.environment(self.environment)
+        ignored = {'TMPDIR','PWD','OLDPWD','SHLVL','_','PBGATE_FIXTURE_OWNER','PBGATE_CONTEXT','PBGATE_PROCESS_OWNER'}
+        inputs = {'format':1, 'phase':definition.get('baseline','initial'),
+            'binary':content.file(root / definition['binary']),
+            'migrations':content.inventory(root, [definition['migrations']]) if definition.get('migrations') else {},
+            'hooks':self.dependencies.preparation(hooks) if hooks and self.dependencies else content.inventory(root,[hooks]) if hooks else {},
+            'declared':content.inventory(root,definition.get('inputs', [])),
+            'environment':{key:digest(value) for key,value in environment.items() if key not in ignored},
+            'calendar':datetime.now(timezone.utc).date().isoformat(),
+            'platform':[platform.system(),platform.release(),platform.machine()],
+            'analyzer':content.file(Path(__file__).resolve().parents[1] / 'src/dependencies.js'),
+            'driver':content.inventory(Path(__file__).parent,['*.py','*.js'])}
+        return 'fixture-' + digest(inputs)
 
     def request(self, path, body=None, auth=True, timeout=5):
         headers = {'Content-Type': 'application/json'}
@@ -65,6 +86,8 @@ class PocketBaseFixture:
             shutil.copy2(Path(__file__).with_name('fixture-control.js'), self.directory / 'hooks/pbgate.pb.js')
         self.environment = dict(definition.get('env', {}), PBGATE_FIXTURE_OWNER=self.owner,
             PBGATE_NATIVE_STORE_KEYS=json.dumps(definition.get('nativeStoreKeys', [])))
+        for name in ('npm_lifecycle_event','npm_lifecycle_script'):
+            self.environment[name] = ''
         if session.profile == 'quiet':
             self.environment['GOMAXPROCS'] = '2'
         paths = ['--dir', str(self.directory / 'data'), '--hooksDir', str(self.directory / 'hooks'),
@@ -77,32 +100,46 @@ class PocketBaseFixture:
                 raise subprocess.TimeoutExpired(['PocketBase fixture', self.name], startup_limit)
             return value
         preparation_log = session.logs / ('fixture-' + self.name + '-prepare.log')
-        for args in (['migrate', 'up'], ['superuser', 'upsert', 'admin@pbgate.test', self.password]):
-            code, _ = session.run([binary, *args, *paths], self.project.root, preparation_log,
-                self.environment, remaining(), admission=False)
-            if code:
-                raise RuntimeError('PocketBase preparation failed; see ' + str(preparation_log))
+        baseline = definition.get('baseline','initial')
+        key = self.baseline_key() if baseline else None
+        metadata = session.receipts.restore_directory(key, self.directory / 'data') if key else None
+        self.baseline = {'hit':bool(metadata), 'phase':baseline, 'key':key}
+        if metadata:
+            self.password = metadata['password']
+        else:
+            for args in (['migrate', 'up'], ['superuser', 'upsert', 'admin@pbgate.test', self.password]):
+                code, _ = session.run([binary, *args, *paths], self.project.root, preparation_log,
+                    self.environment, remaining(), admission=False)
+                if code:
+                    raise RuntimeError('PocketBase preparation failed; see ' + str(preparation_log))
+            if baseline == 'initial':
+                self.publish_baseline(key)
         with socket.socket() as listener:
             listener.bind(('127.0.0.1', 0))
             port = listener.getsockname()[1]
         self.url = 'http://127.0.0.1:' + str(port)
         self.output = (session.logs / ('fixture-' + self.name + '-' + self.owner[:8] + '.log')).open('ab')
-        self.child = session.spawn([binary, 'serve', *paths, '--hooksWatch=false', '--http', '127.0.0.1:' + str(port),
-            '--hooksPool=' + str(definition.get('hooksPool', 8))], self.project.root, self.output, self.environment)
-        while True:
-            remaining()
-            session.check_resources(started)
-            if self.child.poll() is not None:
-                raise RuntimeError('PocketBase exited during startup; see ' + str(self.output.name))
-            try:
-                self.request('/api/health', auth=False, timeout=min(5, remaining()))
-                break
-            except (urllib.error.URLError, TimeoutError):
-                if time.monotonic() >= deadline:
-                    raise subprocess.TimeoutExpired(['PocketBase fixture', self.name], startup_limit)
-                session.cancelled.wait(.05)
-        self.token = self.request('/api/collections/_superusers/auth-with-password',
-            {'identity':'admin@pbgate.test', 'password':self.password}, auth=False, timeout=min(5, remaining()))['token']
+        def serve():
+            self.child = session.spawn([binary, 'serve', *paths, '--hooksWatch=false', '--http', '127.0.0.1:' + str(port),
+                '--hooksPool=' + str(definition.get('hooksPool', 8))], self.project.root, self.output, self.environment)
+            while True:
+                remaining()
+                session.check_resources(started)
+                if self.child.poll() is not None:
+                    raise RuntimeError('PocketBase exited during startup; see ' + str(self.output.name))
+                try:
+                    self.request('/api/health', auth=False, timeout=min(5, remaining()))
+                    break
+                except (urllib.error.URLError, TimeoutError):
+                    session.cancelled.wait(.05)
+            self.token = self.request('/api/collections/_superusers/auth-with-password',
+                {'identity':'admin@pbgate.test', 'password':self.password}, auth=False, timeout=min(5, remaining()))['token']
+        serve()
+        if baseline == 'schema' and not metadata:
+            session.stop(self.child)
+            self.child = None
+            self.publish_baseline(key)
+            serve()
         if definition.get('seed'):
             code, _ = session.run(definition['seed'], self.project.root, preparation_log,
                 dict(self.environment, **self.context('seed')), remaining(), admission=False)
@@ -113,6 +150,12 @@ class PocketBaseFixture:
                 shutil.copytree(self.directory / 'data/storage', self.directory / 'storage-baseline')
             self.request('/__pbgate__', {'owner':self.owner, 'operation':'checkpoint'}, timeout=min(5, remaining()))
         return time.monotonic() - started
+
+    def publish_baseline(self, key):
+        if self.baseline_key() != key:
+            raise RuntimeError('Fixture preparation inputs changed; baseline was not saved')
+        self.session.receipts.save_directory(key, self.directory / 'data', {'password':self.password},
+            self.directory / ('baseline-' + secrets.token_hex(8)))
 
     def reset(self, timeout=5):
         start = time.monotonic()
@@ -138,16 +181,19 @@ class PocketBaseFixture:
 
 
 class PocketBasePool:
-    def __init__(self, project, session):
-        self.project, self.session = project, session
+    def __init__(self, project, session, dependencies=None):
+        self.project, self.session, self.dependencies = project, session, dependencies
         self.instances = {}
 
-    def inputs(self, name, observations=None):
+    def inputs(self, name, observations=None, scope=None):
         fixture, content = self.project.fixtures[name], self.session.content
         paths = [*fixture.get('inputs', []), *(fixture[key] for key in ('hooks', 'migrations') if fixture.get(key))]
-        paths.extend(arg for arg in fixture.get('seed', []) if not Path(arg).is_absolute() and (self.project.root / arg).is_file())
+        if scope and scope['scope'] == 'precise':
+            paths = [path for path in paths if not any(path == directory or path.startswith(directory + '/') for directory in (scope['sources'],scope['outdir']))]
+        paths.extend(self.project.command_files(fixture.get('seed', [])))
         result = content.inventory(self.project.root, paths, observations)
         result['binary'] = content.file((self.project.root / fixture['binary']).resolve(), observations)
+        result['calendar'] = datetime.now(timezone.utc).date().isoformat()
         return result
 
     def run(self, check, log):
@@ -159,7 +205,7 @@ class PocketBasePool:
         fixture = self.instances.get(check.fixture) if shared else None
         reused = fixture is not None
         if not fixture:
-            fixture = PocketBaseFixture(self.project, session, check.fixture)
+            fixture = PocketBaseFixture(self.project, session, check.fixture, self.dependencies)
             if shared:
                 self.instances[check.fixture] = fixture
         startup = reset = 0
@@ -174,7 +220,7 @@ class PocketBasePool:
             if shared:
                 reset = fixture.reset(timeout=min(5, max(.01, deadline - time.monotonic())))
             metrics.update(wall_seconds=round(time.monotonic()-start, 4), admission_seconds=round(waited, 4),
-                           fixture={'name':check.fixture, 'reused':reused, 'startupSeconds':round(startup, 4), 'resetSeconds':round(reset, 4)})
+                           fixture={'name':check.fixture, 'reused':reused, 'baseline':fixture.baseline, 'startupSeconds':round(startup, 4), 'resetSeconds':round(reset, 4)})
             return code, metrics
         except BaseException:
             if shared:

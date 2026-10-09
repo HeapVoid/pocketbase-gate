@@ -2,12 +2,10 @@
 
 Resource-aware verification for PocketBase + Imba projects. Projects declare checks and fixture requirements; the gate owns planning, receipts, process supervision, isolation and cleanup.
 
-This is the first development version. It is available from GitHub; npm publication is a separate release step.
-
 ## Install
 
 ```sh
-bun add --dev github:HeapVoid/pocketbase-gate
+bun add --dev pocketbase-gate
 ```
 
 Runtime requirements: macOS or Linux, Node 20+ and Python 3.9+. Imba compilation additionally uses Bun and the consumer's installed `bimba-cli`. PocketBase fixtures use an explicitly configured local binary (native controls are tested on PocketBase 0.40.4). The package never downloads a binary or starts an application server automatically.
@@ -42,6 +40,7 @@ Create `pbgate.json` in the project root:
       "tests": ["test/notes.js"],
       "requires": ["compile"],
       "domains": ["notes"],
+      "dependencies": {"routes": ["/api/notes"]},
       "fixture": "api",
       "isolation": "fresh"
     }
@@ -90,7 +89,7 @@ The default `quiet` profile permits one check at a time, uses background schedul
 
 Defaults: CPU idle at least 30%, swap-out at most 16 MiB/s, admission timeout 300 seconds, owned memory budget 6 GiB, receipt/artifact budget 2 GiB. Override these through the config's `resources`. Scheduling priorities and sampled memory supervision are not operating-system hard CPU/RAM quotas.
 
-Every check has a wall-time limit (default 120 seconds). PocketBase startup has its own bound, and fixture preparation is included in the check's elapsed budget. Cancellation, timeout and loss of the supervisor dispose owned process groups and temporary data. Existing dev servers are outside these groups.
+Every check has a wall-time limit (default 120 seconds). PocketBase startup has its own bound, and fixture preparation is included in the check's elapsed budget. Cancellation, timeout and loss of the supervisor dispose owned process groups and temporary data. An inherited ownership marker also tracks detached descendants that leave their original group. Bimba's typecheck daemon is disabled for gate commands in both profiles; descendants inherit scheduling priority. Existing dev servers retain their own ownership.
 
 ## Dependency and cache contract
 
@@ -101,11 +100,17 @@ Every check has a wall-time limit (default 120 seconds). PocketBase startup has 
 - Changes, directory additions and metadata changes during a run prevent success publication. A later failed check preserves only stable, completed successful receipts. A partial plan never becomes proof of the full required gate.
 - `testInventory` rejects new unregistered test files and duplicate release ownership. `required` preserves the expected release coverage.
 
-Time-dependent checks must declare the relevant time as an input or disable result caching. Complete dependency declarations remain the consumer's responsibility; the first version does not infer a narrow import graph or automatically classify historical behavior.
+`compileHooks` writes a validated compiler descriptor. A check's `dependencies` can select route prefixes (`{"routes":["/api/notes"]}`) or model roots (`{"mode":"models","roots":["src/models/note.imba"]}`). The analyzer follows imports, model loaders and literal file reads across every branch, including branches the test did not execute. Bootstrap and record hooks remain common dependencies; unrelated inline route bodies can change without invalidating a narrow route proof or stopped schema baseline. Test/helper descriptors are also cached and validated against their complete file contents.
+
+Missing, stale or opaque descriptors retain the broad scope. Dynamic paths and unknown loaders cannot establish a narrow proof. Keep additional non-code dependencies in `inputs`; when a descriptor is valid, it replaces broad source/output directory entries with the selected scope. Installed packages and compiler configuration remain bound to the proof.
+
+Time-dependent checks must declare the relevant time as an input or disable result caching. PocketBase fixture proofs and baselines bind the current UTC date. The gate does not infer application-specific historical or external-state semantics.
 
 ## PocketBase isolation
 
-`fresh` is the default: each check gets a separate runtime, data directory and bootstrap. Use it for restart, schema mutation, cron changes, native faults and module state that cannot be restored.
+`fresh` is the default: each check gets a separate runtime and data directory. Use it for restart, schema mutation, cron changes, native faults and module state that cannot be restored.
+
+Fixtures reuse a verified, stopped baseline rather than repeating database preparation. The default `baseline: "initial"` caches migrations and disposable superuser setup. Set `baseline: "schema"` to cache one completed bootstrap as well, when bootstrap is idempotent and repeating it over prepared data is valid. Set `baseline: false` for first-boot behavior. Binary, migrations, bootstrap dependencies, declared inputs, environment, engine and UTC date bind the key. Corrupt artifacts rebuild; changing an unrelated route body preserves a complete bootstrap scope. Each runtime receives a separate copy, and `seed` always runs fresh after restoration. Baselines share the bounded artifact budget and keep disposable credentials in private metadata.
 
 `shared` explicitly opts compatible checks into one session-owned runtime. The engine checkpoints all main-database tables and trigger definitions, the baseline storage files and application store. After each scenario it restores records transactionally, verifies schema and rows, reloads collection/settings caches and restores storage and store. Shared scenarios run sequentially even in `fast`.
 
@@ -117,7 +122,7 @@ There is no deploy action: this package verifies the candidate. Production switc
 
 ```sh
 python3 -m unittest discover -s tests -p 'test_*.py'
-node --test tests/context.test.js
+node --test tests/*.test.js
 PBGATE_TEST_BINARY=/absolute/path/pocketbase npm run test:native
 # Also exercise real Imba compilation in a separate consumer directory:
 PBGATE_TEST_BINARY=/absolute/path/pocketbase \
@@ -128,3 +133,9 @@ npm pack --dry-run
 The engine retains the established Python content/resource/process owners extracted from HeapVoid's workspace verification system. PocketBase preparation and Bimba compilation are stack adapters; application names, routes, schema and deployment rules are absent from the core. The same npm artifact supplies CLI, adapters and client context.
 
 See [architecture](docs/architecture.md) for ownership and next development steps. Config fields are described in [schema.json](schema.json).
+
+## Publishing
+
+Update `package.json` and `package-lock.json`, commit the version, then push its `v<version>` tag. The GitHub workflow runs the same Python, JavaScript and native PocketBase/Imba checks used on branches, verifies the tag against the package version and publishes to npm using Trusted Publishing. Stable versions use `latest`; prereleases use `next`. Branch pushes run verification only.
+
+The npm trusted publisher is `HeapVoid/pocketbase-gate`, workflow `publish.yml`. It uses GitHub's short-lived OIDC identity and requires no repository npm token. A package must exist before its first trusted publisher can be configured; the initial registry publication is bootstrapped once locally.

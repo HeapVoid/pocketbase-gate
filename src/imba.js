@@ -2,6 +2,7 @@ import {readdir, readFile, writeFile, mkdir, unlink} from 'node:fs/promises';
 import {resolve, relative, join} from 'node:path';
 import {createRequire} from 'node:module';
 import {pathToFileURL} from 'node:url';
+import {writeBackendDependencies} from './dependencies.js';
 
 // Bimba owns Imba compilation. This adapter supplies the PocketBase output
 // contract and removes only files produced by its own preceding build.
@@ -50,5 +51,6 @@ export async function compileHooks({sources = 'src', outdir = 'public', unwrapDe
   }
   await mkdir(output, {recursive:true});
   await writeFile(manifest, JSON.stringify({format:1, outputs:generated.sort()}) + '\n');
+  await writeBackendDependencies(entrypoints, result.outputs, root, {sources:relative(root,source), outdir:relative(root,output)});
   return {files:generated.length};
 }

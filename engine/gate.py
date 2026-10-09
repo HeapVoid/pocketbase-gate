@@ -5,6 +5,7 @@ from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import hashlib
+import errno
 import json
 import os
 from pathlib import Path
@@ -16,11 +17,12 @@ import sys
 import time
 
 from runtime import Content, ProcessSession, ReceiptCache, PROFILES, atomic_json
+from dependencies import DependencyGraph
 
 INTENTS = {'dev', 'release', 'diagnostic'}
 DEFAULT_INPUTS = ['src', 'test', 'tests', 'scripts', 'package.json', 'bun.lock',
                   'bunfig.toml', 'types.d.ts', 'jsconfig.json', '.env', '.env.local', '.env.test']
-OPERATIONAL_ENV = {'PWD', 'OLDPWD', 'SHLVL', '_', 'TMPDIR', 'PBGATE_CONTEXT'}
+OPERATIONAL_ENV = {'PWD', 'OLDPWD', 'SHLVL', '_', 'TMPDIR', 'PBGATE_CONTEXT', 'PBGATE_PROCESS_OWNER'}
 
 
 def digest(value):
@@ -47,6 +49,7 @@ def strings(value, label):
 class Check:
     id: str
     definition: dict
+    default_inputs: bool = False
 
     @property
     def requires(self):
@@ -89,7 +92,7 @@ class Project:
                 raise ValueError('Invalid resource setting: ' + name)
         self.fixtures = document.get('fixtures', {})
         for name, fixture in self.fixtures.items():
-            allowed_fixture = {'binary', 'hooks', 'migrations', 'inputs', 'env', 'seed', 'nativeStoreKeys', 'startupTimeoutSeconds', 'hooksPool'}
+            allowed_fixture = {'binary', 'hooks', 'migrations', 'inputs', 'env', 'seed', 'nativeStoreKeys', 'startupTimeoutSeconds', 'hooksPool', 'baseline'}
             if set(fixture) - allowed_fixture or not isinstance(fixture.get('binary'), str):
                 raise ValueError('Invalid PocketBase fixture: ' + name)
             for key in ('hooks', 'migrations'):
@@ -105,9 +108,11 @@ class Project:
             if not .01 <= fixture.get('startupTimeoutSeconds', 60) <= 86400 or not 1 <= fixture.get('hooksPool', 8) <= 64:
                 raise ValueError('Invalid fixture limits: ' + name)
             self.validate_env(fixture.get('env', {}))
+            if fixture.get('baseline', 'initial') not in (False, 'initial', 'schema'):
+                raise ValueError('Fixture baseline is initial, schema or false')
         self.checks = {}
         check_fields = {'id', 'command', 'inputs', 'inputSets', 'outputs', 'requires', 'intents', 'domains',
-                        'kind', 'tests', 'fixture', 'isolation', 'exclusive', 'timeoutSeconds', 'cache', 'restore', 'env'}
+                        'kind', 'tests', 'fixture', 'isolation', 'exclusive', 'timeoutSeconds', 'cache', 'restore', 'env', 'dependencies'}
         for original in document.get('checks', []):
             check = dict(original)
             name = check.get('id', '')
@@ -158,7 +163,16 @@ class Project:
                 if field in check and not isinstance(check[field], bool):
                     raise ValueError(field + ' must be a boolean')
             self.validate_env(check.get('env', {}))
-            self.checks[name] = Check(name, check)
+            if 'dependencies' in check:
+                policy = check['dependencies']
+                if (not isinstance(policy, dict) or set(policy) - {'mode','outdir','routes','roots'}
+                        or policy.get('mode', 'routes') not in ('routes','models')):
+                    raise ValueError('Invalid dependency policy: ' + name)
+                relative(policy.get('outdir','public'), 'dependency output')
+                strings(policy.get('routes', []), 'dependency routes')
+                for path in strings(policy.get('roots', []), 'dependency roots'):
+                    relative(path, 'dependency root')
+            self.checks[name] = Check(name, check, 'inputs' not in original)
         if not self.checks:
             raise ValueError('Register at least one check')
         self.closure(self.checks)
@@ -172,7 +186,7 @@ class Project:
     def validate_env(environment):
         if not isinstance(environment, dict) or any(not isinstance(key, str) or not isinstance(value, str) for key, value in environment.items()):
             raise ValueError('Environment must map names to strings')
-        if set(environment) & {'PBGATE_CONTEXT', 'PBGATE_PROFILE', 'TMPDIR'}:
+        if set(environment) & {'PBGATE_CONTEXT', 'PBGATE_PROFILE', 'PBGATE_PROCESS_OWNER', 'BIMBA_NO_TYPECHECK_DAEMON', 'TMPDIR'}:
             raise ValueError('The gate owns its runtime environment fields')
 
     @classmethod
@@ -226,8 +240,7 @@ class Project:
                   for path in self.root.glob(relative(pattern, 'test inventory')) if path.is_file()}
         owners = {name: [] for name in actual}
         for check in self.checks.values():
-            patterns = check.definition['tests'] + [arg for arg in check.definition['command']
-                if (self.root / arg).is_file() and not Path(arg).is_absolute()]
+            patterns = check.definition['tests'] + self.command_files(check.definition['command'])
             for pattern in patterns:
                 paths = [path for path in self.root.glob(pattern) if path.is_file()]
                 if pattern in check.definition['tests'] and not paths:
@@ -241,6 +254,19 @@ class Project:
                 raise ValueError('Unregistered test: ' + name)
             if sum('release' in check.definition['intents'] for check in checks) > 1:
                 raise ValueError('A physical test needs one release owner: ' + name)
+
+    def command_files(self, command):
+        files = []
+        for argument in command:
+            if Path(argument).is_absolute():
+                continue
+            try:
+                if (self.root / argument).is_file():
+                    files.append(argument)
+            except OSError as error:
+                if error.errno != errno.ENAMETOOLONG:
+                    raise
+        return files
 
 
 @dataclass
@@ -260,20 +286,33 @@ class Gate:
         self.identities = {}
         self.pending_receipts = []
         from pocketbase import PocketBasePool
-        self.fixtures = PocketBasePool(project, session)
+        self.dependencies = DependencyGraph(project, session)
+        self.fixtures = PocketBasePool(project, session, self.dependencies)
         self.environment = {name: hashlib.sha256(value.encode()).hexdigest() for name, value in session.environment().items()
                             if name not in OPERATIONAL_ENV}
         engine = Path(__file__).parent
         self.implementation_observed = {}
         self.implementation = session.content.inventory(engine, ['*.py', '*.js'], self.implementation_observed)
         self.implementation.update({'client:' + name: value for name, value in session.content.inventory(engine.parent / 'src', ['*.js'], self.implementation_observed).items()})
+        self.implementation['parser'] = session.content.common_digest(engine.parent, ['node_modules/typescript'], self.implementation_observed)
 
     def check_inputs(self, check, observed=None):
         project, content = self.project, self.session.content
         spec = check.definition
+        scope = self.dependencies.inputs(check, observed)
         paths = [*spec['inputs'], *spec['tests']]
-        paths.extend(arg for arg in spec['command'] if not Path(arg).is_absolute() and (project.root / arg).is_file())
+        if scope and scope['scope'] == 'precise':
+            paths = [path for path in paths if not any(path == directory or path.startswith(directory + '/')
+                     for directory in (scope['sources'], scope['outdir']))]
+            if check.default_inputs:
+                paths = [path for path in paths if path not in ('scripts','test','tests')]
+        elif scope:
+            paths.extend(DEFAULT_INPUTS)
+        paths.extend(project.command_files(spec['command']))
         inputs = content.inventory(project.root, paths, observed)
+        if scope:
+            inputs.update(scope['files'])
+            inputs['dependencyScope'] = scope['scope']
         inputs['installedDependencies'] = content.common_digest(project.root, ['node_modules'], observed)
         for tool in [spec['command'][0], *project.tools]:
             executable = shutil.which(tool) or str(project.root / tool)
@@ -283,19 +322,20 @@ class Gate:
                 inputs['externalCommand:' + argument] = content.file(argument, observed)
         if check.fixture:
             fixture = project.fixtures[check.fixture]
-            inputs.update({'fixture:' + name: value for name, value in self.fixtures.inputs(check.fixture, observed).items()})
+            inputs.update({'fixture:' + name: value for name, value in self.fixtures.inputs(check.fixture, observed, scope).items()})
             inputs['fixtureRecipe'] = digest(fixture)
         inputs['implementation'] = digest(self.implementation)
         inputs['recipe'] = digest(spec)
-        inputs['prerequisites'] = digest({name: self.identities[name] for name in check.requires})
+        inputs['prerequisites'] = digest({name:(digest(self.project.checks[name].definition)
+            if scope and scope['scope'] == 'precise' and self.project.checks[name].definition['kind'] == 'prepare'
+            else self.identities[name]) for name in check.requires})
         return inputs
 
     def sources(self, observed):
         produced = {path for check in self.plan.checks for path in check.outputs}
         patterns = {path for check in self.plan.checks for path in [*check.definition['inputs'], *check.definition['tests']]
                     if not any(path == output or path.startswith(output + '/') for output in produced)}
-        patterns.update(arg for check in self.plan.checks for arg in check.definition['command']
-                        if not Path(arg).is_absolute() and (self.project.root / arg).is_file())
+        patterns.update(arg for check in self.plan.checks for arg in self.project.command_files(check.definition['command']))
         for check in self.plan.checks:
             if check.fixture:
                 fixture = self.project.fixtures[check.fixture]

@@ -12,6 +12,7 @@ import os
 from pathlib import Path
 import platform
 import select
+import secrets
 import shutil
 import signal
 import stat
@@ -381,9 +382,20 @@ class OwnedProcesses:
     def __init__(self, session):
         self.session = session
         self.groups = set()
+        self.tokens = {}
         self.guard = None
         self.cancelled = session.cancelled
         self.lock = threading.RLock()
+
+    def __iter__(self):
+        with self.lock:
+            groups, tokens = set(self.groups), set(self.tokens.values())
+        for pid in ProcessSession.tagged_processes(tokens):
+            try:
+                groups.add(os.getpgid(pid))
+            except ProcessLookupError:
+                pass
+        return iter(groups)
 
     def start(self, log):
         if self.guard is not None:
@@ -392,10 +404,12 @@ class OwnedProcesses:
         self.ack, reply = os.pipe()
         try:
             Path(log).parent.mkdir(parents=True, exist_ok=True)
+            environment = dict(os.environ)
+            environment.pop('PBGATE_PROCESS_OWNER',None)
             with Path(log).open('ab') as errors:
                 self.guard = subprocess.Popen([sys.executable, str(Path(__file__).resolve()),
                     '--process-owner', str(receive), str(reply), str(os.getpid()), str(os.getppid()), str(self.session.directory)],
-                    pass_fds=(receive,reply,self.session.lock.fileno()), stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                    pass_fds=(receive,reply,self.session.lock.fileno()), env=environment, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                     stderr=errors, start_new_session=True)
         except BaseException:
             os.close(self.send)
@@ -407,8 +421,8 @@ class OwnedProcesses:
         if os.read(self.ack,1) != b'1':
             raise RuntimeError('Verification process owner did not start; see '+str(log))
 
-    def request(self, operation, group):
-        os.write(self.send, (json.dumps({'operation':operation,'group':group})+'\n').encode())
+    def request(self, operation, group, token=None):
+        os.write(self.send, (json.dumps({'operation':operation,'group':group,'token':token})+'\n').encode())
         if os.read(self.ack,1) != b'1':
             raise RuntimeError('Verification process owner disconnected')
 
@@ -419,18 +433,21 @@ class OwnedProcesses:
             self.start(log)
             receive, allow = os.pipe()
             child = None
+            token = secrets.token_hex(24)
+            options['env'] = dict(options.get('env') or os.environ, PBGATE_PROCESS_OWNER=token)
             try:
                 child = subprocess.Popen([sys.executable,str(Path(__file__).resolve()),'--owned-launch',str(receive),*command],
                     pass_fds=(receive,), start_new_session=True, **options)
                 self.groups.add(child.pid)
-                self.request('add',child.pid)
+                self.tokens[child.pid] = token
+                self.request('add',child.pid,token)
                 if self.cancelled.is_set():
                     raise KeyboardInterrupt('Verification cancelled before launch')
                 os.write(allow,b'1')
                 return child
             except BaseException:
                 if child is not None:
-                    ProcessSession.stop_group(child.pid)
+                    ProcessSession.stop_group(child.pid,token)
                     child.wait()
                     self.discard(child.pid)
                 raise
@@ -443,6 +460,7 @@ class OwnedProcesses:
             if group in self.groups:
                 self.request('remove',group)
                 self.groups.discard(group)
+                self.tokens.pop(group, None)
 
     def close(self):
         if self.guard is None:
@@ -457,7 +475,7 @@ class OwnedProcesses:
 
 
 def supervise_processes(receive, reply, owner, parent, directory):
-    groups, pending = set(), b''
+    groups, pending = {}, b''
     reason = 'supervisor_disconnected'
     queue = None
     parent_fd = None
@@ -491,8 +509,8 @@ def supervise_processes(receive, reply, owner, parent, directory):
                 while b'\n' in pending:
                     line,pending = pending.split(b'\n',1)
                     message = json.loads(line)
-                    if message['operation']=='add':groups.add(message['group'])
-                    elif message['operation']=='remove':groups.discard(message['group'])
+                    if message['operation']=='add':groups[message['group']]=message['token']
+                    elif message['operation']=='remove':groups.pop(message['group'],None)
                     else:raise ValueError('Unknown process ownership operation')
                     os.write(reply,b'1')
             if parent_exited:
@@ -504,8 +522,8 @@ def supervise_processes(receive, reply, owner, parent, directory):
         if queue:queue.close()
         if parent_fd is not None:os.close(parent_fd)
         errors = []
-        for group in groups:
-            try:ProcessSession.stop_group(group)
+        for group, token in groups.items():
+            try:ProcessSession.stop_group(group,token)
             except Exception as error:errors.append(str(error))
         # The inherited flock remains held until process and data cleanup ends.
         # Logs and persistent artifacts live outside this owned temp directory.
@@ -529,7 +547,7 @@ class ProcessSession:
         self.monitor = monitor or Monitor(policy=self.policy)
         self.cancelled = threading.Event()
         self._processes = OwnedProcesses(self)
-        self.monitor.groups = self._processes.groups
+        self.monitor.groups = self._processes
         self.previous_signals = {}
         self.lock_directory = Path(lock_directory or Path.home() / '.cache/pocketbase-gate')
         self.directory = None
@@ -568,7 +586,9 @@ class ProcessSession:
     def environment(self, extra=None):
         temporary = self.directory / 'tmp'
         temporary.mkdir(exist_ok=True)
-        return dict(os.environ, TMPDIR=str(temporary), PBGATE_PROFILE=self.profile, **(extra or {}))
+        environment = dict(os.environ, TMPDIR=str(temporary), PBGATE_PROFILE=self.profile, **(extra or {}))
+        environment['BIMBA_NO_TYPECHECK_DAEMON'] = '1'
+        return environment
 
     def spawn(self, command, cwd, log, env=None):
         return self._processes.spawn(schedule(command, self.profile),
@@ -576,11 +596,9 @@ class ProcessSession:
             stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT)
 
     def stop(self, child):
-        try:
-            self.stop_group(child.pid)
-            child.wait()
-        finally:
-            self._processes.discard(child.pid)
+        self.stop_group(child.pid, self._processes.tokens.get(child.pid))
+        child.wait()
+        self._processes.discard(child.pid)
 
     def check_resources(self, start=0):
         if self.cancelled.is_set():
@@ -612,30 +630,57 @@ class ProcessSession:
             cpu_seconds=round(usage.ru_utime + usage.ru_stime, 4), admission_seconds=round(waited, 4))
 
     @staticmethod
-    def stop_group(group):
+    def tagged_processes(token):
+        if not token:
+            return set()
+        tokens = {token} if isinstance(token,str) else token
+        markers = {('PBGATE_PROCESS_OWNER=' + value).encode() for value in tokens}
+        found = set()
+        if platform.system() == 'Linux':
+            for name in os.listdir('/proc'):
+                if not name.isdigit():
+                    continue
+                try:
+                    if (Path('/proc') / name).stat().st_uid != os.getuid():
+                        continue
+                    if markers.intersection((Path('/proc') / name / 'environ').read_bytes().split(b'\0')):
+                        state = (Path('/proc') / name / 'stat').read_text().rsplit(')',1)[1].split()[0]
+                        if state != 'Z':
+                            found.add(int(name))
+                except (OSError, IndexError):
+                    pass
+        else:
+            # Read privately: process environments never enter logs or reports.
+            rows = subprocess.check_output(['ps','eww','-axo','pid=,stat=,command=']).splitlines()
+            for row in rows:
+                fields = row.split(None,2)
+                if len(fields) == 3 and markers.intersection(fields[2].split()) and not fields[1].startswith(b'Z'):
+                    found.add(int(fields[0]))
+        return found
+
+    @staticmethod
+    def stop_group(group, token=None):
+        def terminate(signum):
+            try:
+                os.killpg(group,signum)
+            except ProcessLookupError:
+                pass
+            for pid in ProcessSession.tagged_processes(token):
+                try:
+                    os.kill(pid,signum)
+                except ProcessLookupError:
+                    pass
         def finished():
             rows = subprocess.check_output(['ps', '-axo', 'pgid=,stat='], text=True).splitlines()
             return not any(int(fields[0]) == group and not fields[1].startswith('Z')
-                for fields in (row.split() for row in rows) if len(fields) == 2)
-        try:
-            os.killpg(group, signal.SIGTERM)
-        except ProcessLookupError:
-            return
-        except PermissionError:
-            if finished():
-                return
+                for fields in (row.split() for row in rows) if len(fields) == 2) and not ProcessSession.tagged_processes(token)
+        terminate(signal.SIGTERM)
         deadline = time.monotonic() + 5
         while time.monotonic() < deadline:
             if finished():
                 return
             time.sleep(.05)
-        try:
-            os.killpg(group, signal.SIGKILL)
-        except ProcessLookupError:
-            return
-        except PermissionError:
-            if not finished():
-                raise
+        terminate(signal.SIGKILL)
         deadline = time.monotonic() + 5
         while not finished():
             if time.monotonic() >= deadline:
@@ -646,7 +691,7 @@ class ProcessSession:
         failures = []
         for group in set(self._processes.groups):
             try:
-                self.stop_group(group)
+                self.stop_group(group, self._processes.tokens.get(group))
                 self._processes.discard(group)
             except Exception as failure:
                 failures.append(failure)
@@ -675,6 +720,7 @@ class ReceiptCache:
         self.content = content or Content()
         self._candidates = None
         self._candidate_lock = threading.Lock()
+        self._artifact_lock = threading.RLock()
 
     def candidates(self, stage):
         with self._candidate_lock:
@@ -783,6 +829,62 @@ class ReceiptCache:
             if self._candidates is not None:
                 for entries in self._candidates.values():
                     entries[:] = [(path, value) for path, value in entries if path.name != key]
+
+    def directory_inventory(self, directory):
+        result = {}
+        for path in sorted(Path(directory).rglob('*')):
+            name = str(path.relative_to(directory))
+            if path.is_symlink():
+                raise ValueError('Prepared artifacts require regular files and directories')
+            result[name + '/' if path.is_dir() else name] = None if path.is_dir() else self.content.file(path)
+        return result
+
+    def restore_directory(self, key, destination):
+        with self._artifact_lock:
+            entry = self.directory / key
+            copying = False
+            try:
+                manifest = json.loads((entry / 'artifact.json').read_text())
+                if not (entry / 'data').is_dir():
+                    return None
+                metadata = manifest['metadata']
+                metadata_hash = hashlib.sha256(json.dumps(metadata, sort_keys=True).encode()).hexdigest()
+                if (manifest['format'] != 1 or manifest['key'] != key or manifest['metadata_hash'] != metadata_hash
+                        or self.directory_inventory(entry / 'data') != manifest['outputs']):
+                    return None
+                if Path(destination).exists():
+                    return None
+                copying = True
+                shutil.copytree(entry / 'data', destination)
+                if self.directory_inventory(destination) != manifest['outputs']:
+                    shutil.rmtree(destination)
+                    return None
+                os.utime(entry, None)
+                return metadata
+            except (OSError, ValueError, KeyError, TypeError):
+                if copying:
+                    shutil.rmtree(destination, ignore_errors=True)
+                return None
+
+    def save_directory(self, key, source, metadata, temporary):
+        with self._artifact_lock:
+            outputs = self.directory_inventory(source)
+            temporary = Path(temporary)
+            temporary.mkdir(mode=0o700)
+            try:
+                shutil.copytree(source, temporary / 'data')
+                if self.directory_inventory(source) != outputs or self.directory_inventory(temporary / 'data') != outputs:
+                    raise RuntimeError('Prepared database changed during publication')
+                manifest = {'format':1, 'key':key, 'outputs':outputs, 'metadata':metadata,
+                    'metadata_hash':hashlib.sha256(json.dumps(metadata, sort_keys=True).encode()).hexdigest()}
+                atomic_json(temporary / 'artifact.json', manifest)
+                (temporary / 'artifact.json').chmod(0o600)
+                target = self.directory / key
+                if target.exists():
+                    shutil.rmtree(target)
+                temporary.rename(target)
+            finally:
+                shutil.rmtree(temporary, ignore_errors=True)
 
     def prune(self, limit=CACHE_LIMIT):
         entries = []

@@ -86,6 +86,20 @@ class ExecutionTests(unittest.TestCase):
         row = subprocess.run(['ps', '-p', str(pid), '-o', 'stat='], capture_output=True, text=True).stdout.strip()
         self.assertTrue(not row or row.startswith('Z'))
 
+    def test_detached_tool_cannot_survive_the_owned_command(self):
+        program = "import subprocess,sys,time; from pathlib import Path; child=subprocess.Popen([sys.executable,'-c','import time; time.sleep(30)'],start_new_session=True); Path('detached.pid').write_text(str(child.pid)); time.sleep(30)"
+        code, report = self.run_gate([self.check('detached', program, timeoutSeconds=.4)])
+        self.assertEqual(code, 124)
+        pid = int((self.root / 'detached.pid').read_text())
+        row = subprocess.run(['ps','-p',str(pid),'-o','stat='],capture_output=True,text=True).stdout.strip()
+        if row and not row.startswith('Z'):
+            os.kill(pid, signal.SIGKILL)
+        self.assertTrue(not row or row.startswith('Z'), 'Detached tool outlived its gate')
+
+    def test_gate_tools_inherit_background_priority_without_a_typecheck_daemon(self):
+        program = "import os,subprocess,sys; assert os.getpriority(os.PRIO_PROCESS,0)>=10; assert os.environ['BIMBA_NO_TYPECHECK_DAEMON']=='1'; subprocess.run([sys.executable,'-c',\"import os; assert os.getpriority(os.PRIO_PROCESS,0)>=10; assert os.environ['BIMBA_NO_TYPECHECK_DAEMON']=='1'\"],check=True)"
+        self.assertEqual(self.run_gate([self.check('priority',program)], intent='dev', selected=['priority'])[0], 0)
+
     def test_fast_scheduler_overlaps_independent_checks_and_respects_dependencies(self):
         program = "import time; from pathlib import Path; name='{name}'; Path(name+'.start').write_text(str(time.time_ns())); time.sleep(.3); Path(name+'.end').write_text(str(time.time_ns()))"
         checks = [self.check('a', program.format(name='a')), self.check('b', program.format(name='b')),
@@ -150,14 +164,16 @@ class ExecutionTests(unittest.TestCase):
         self.assertFalse(report['checks'][0]['cached'])
 
     def test_loss_of_supervisor_cleans_owned_children_and_releases_lease(self):
-        driver = "import sys,time; from pathlib import Path; sys.path.insert(0,sys.argv[1]); from support import session; root=Path(sys.argv[2]);\nwith session(root) as owned:\n child=owned.spawn([sys.executable,'-c','import time; time.sleep(30)'],root,sys.stdout); (root/'owned.pid').write_text(str(child.pid)); time.sleep(30)\n"
-        owner = subprocess.Popen([sys.executable, '-c', driver, str(ROOT / 'tests'), str(self.root)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        program = "import subprocess,sys,time; from pathlib import Path; child=subprocess.Popen([sys.executable,'-c','import time; time.sleep(30)'],start_new_session=True); Path('detached.pid').write_text(str(child.pid)); time.sleep(30)"
+        driver = "import sys,time; from pathlib import Path; sys.path.insert(0,sys.argv[1]); from support import session; root=Path(sys.argv[2]);\nwith session(root) as owned:\n child=owned.spawn([sys.executable,'-c',sys.argv[3]],root,sys.stdout); (root/'owned.pid').write_text(str(child.pid)); time.sleep(30)\n"
+        owner = subprocess.Popen([sys.executable, '-c', driver, str(ROOT / 'tests'), str(self.root), program], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         self.addCleanup(lambda: (owner.kill(), owner.wait()) if owner.poll() is None else None)
         deadline = time.monotonic() + 5
-        while not (self.root / 'owned.pid').exists() and time.monotonic() < deadline:
+        while not (self.root / 'detached.pid').exists() and time.monotonic() < deadline:
             time.sleep(.05)
         self.assertTrue((self.root / 'owned.pid').exists())
         pid = int((self.root / 'owned.pid').read_text())
+        detached = int((self.root / 'detached.pid').read_text())
         owner.kill()
         owner.wait()
         deadline = time.monotonic() + 5
@@ -165,6 +181,10 @@ class ExecutionTests(unittest.TestCase):
             time.sleep(.05)
         self.assertFalse(list((self.root / '.pbgate').glob('run-*')))
         row = subprocess.run(['ps', '-p', str(pid), '-o', 'stat='], capture_output=True, text=True).stdout.strip()
+        self.assertTrue(not row or row.startswith('Z'))
+        row = subprocess.run(['ps', '-p', str(detached), '-o', 'stat='], capture_output=True, text=True).stdout.strip()
+        if row and not row.startswith('Z'):
+            os.kill(detached,signal.SIGKILL)
         self.assertTrue(not row or row.startswith('Z'))
         import fcntl
         with (self.root / '.leases/machine.lock').open() as lease:
