@@ -6,7 +6,7 @@ import {writeBackendDependencies} from './dependencies.js';
 
 // Bimba owns Imba compilation. This adapter supplies the PocketBase output
 // contract and removes only files produced by its own preceding build.
-export async function compileHooks({sources = 'src', outdir = 'public', unwrapDefault = true} = {}) {
+export async function compileHooks({sources = 'src', outdir = 'public', unwrapDefault = true, manifest = '.pbgate-dependencies.json'} = {}) {
   if (!globalThis.Bun?.build) throw Error('compileHooks runs under Bun and uses the project-local bimba-cli');
   const root = process.cwd(), source = resolve(root, sources), output = resolve(root, outdir);
   if (output === root || relative(root, output).startsWith('..') || output === source) throw Error('Use a separate output directory below the project root');
@@ -41,16 +41,22 @@ export async function compileHooks({sources = 'src', outdir = 'public', unwrapDe
       await writeFile(artifact.path, code + '\nif (Object.prototype.hasOwnProperty.call(module.exports, "default")) module.exports = module.exports.default;\n');
     }
   }
-  const manifest = join(output, '.pbgate-hooks.json');
+  const outputsManifest = join(output, '.pbgate-hooks.json');
   let previous = [];
-  try { previous = JSON.parse(await readFile(manifest, 'utf8')).outputs; }
-  catch (error) { if (error.code !== 'ENOENT') throw error; }
+  try { previous = JSON.parse(await readFile(outputsManifest, 'utf8')).outputs; }
+  catch (error) {
+    if (error.code !== 'ENOENT') throw error;
+    try {
+      const preceding = JSON.parse(await readFile(join(output, manifest), 'utf8'));
+      previous = Object.values(preceding.modules).map(module => relative(output, resolve(root, module.output)));
+    } catch (error) {if (error.code !== 'ENOENT') throw error;}
+  }
   for (const name of previous) {
     if (typeof name !== 'string' || name.startsWith('..') || resolve(output, name) === output || relative(output, resolve(output, name)).startsWith('..')) throw Error('Invalid preceding compiler output manifest');
     if (!generated.includes(name)) await unlink(join(output, name)).catch(error => {if (error.code !== 'ENOENT') throw error;});
   }
   await mkdir(output, {recursive:true});
-  await writeFile(manifest, JSON.stringify({format:1, outputs:generated.sort()}) + '\n');
-  await writeBackendDependencies(entrypoints, result.outputs, root, {sources:relative(root,source), outdir:relative(root,output)});
+  await writeFile(outputsManifest, JSON.stringify({format:1, outputs:generated.sort()}) + '\n');
+  await writeBackendDependencies(entrypoints, result.outputs, root, {sources:relative(root,source), outdir:relative(root,output), manifest});
   return {files:generated.length};
 }

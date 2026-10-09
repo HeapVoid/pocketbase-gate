@@ -4,6 +4,7 @@ Extracted from HeapVoid's existing verification runtime. Project-specific
 compilation, routes, environment rules and fixtures live outside this module.
 """
 import ctypes
+from contextlib import contextmanager
 from datetime import datetime, timezone
 import fcntl
 import hashlib
@@ -25,6 +26,7 @@ import time
 
 PROFILES = {'quiet': {'nice': 10, 'qos': 'background', 'workers': 1},
             'fast': {'nice': 5, 'qos': 'utility', 'workers': 2}}
+FOOTPRINT_LIMIT = 6 * 1024**3
 SAMPLE_SECONDS = 2
 CACHE_LIMIT = 2 * 1024**3
 CONTENT_FILE_LIMIT = 200_000
@@ -383,6 +385,7 @@ class OwnedProcesses:
         self.session = session
         self.groups = set()
         self.tokens = {}
+        self.children = {}
         self.guard = None
         self.cancelled = session.cancelled
         self.lock = threading.RLock()
@@ -409,7 +412,7 @@ class OwnedProcesses:
             with Path(log).open('ab') as errors:
                 self.guard = subprocess.Popen([sys.executable, str(Path(__file__).resolve()),
                     '--process-owner', str(receive), str(reply), str(os.getpid()), str(os.getppid()), str(self.session.directory)],
-                    pass_fds=(receive,reply,self.session.lock.fileno()), env=environment, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                    pass_fds=(receive,reply,*(lease.fileno() for lease in self.session.leases)), env=environment, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                     stderr=errors, start_new_session=True)
         except BaseException:
             os.close(self.send)
@@ -440,6 +443,7 @@ class OwnedProcesses:
                     pass_fds=(receive,), start_new_session=True, **options)
                 self.groups.add(child.pid)
                 self.tokens[child.pid] = token
+                self.children[child.pid] = child
                 self.request('add',child.pid,token)
                 if self.cancelled.is_set():
                     raise KeyboardInterrupt('Verification cancelled before launch')
@@ -461,6 +465,9 @@ class OwnedProcesses:
                 self.request('remove',group)
                 self.groups.discard(group)
                 self.tokens.pop(group, None)
+                child = self.children.pop(group, None)
+                if child is not None:
+                    child.wait()
 
     def close(self):
         if self.guard is None:
@@ -510,7 +517,10 @@ def supervise_processes(receive, reply, owner, parent, directory):
                     line,pending = pending.split(b'\n',1)
                     message = json.loads(line)
                     if message['operation']=='add':groups[message['group']]=message['token']
-                    elif message['operation']=='remove':groups.pop(message['group'],None)
+                    elif message['operation']=='remove':
+                        group = message['group']
+                        ProcessSession.stop_group(group, groups.get(group))
+                        groups.pop(group,None)
                     else:raise ValueError('Unknown process ownership operation')
                     os.write(reply,b'1')
             if parent_exited:
@@ -540,10 +550,12 @@ def supervise_processes(receive, reply, owner, parent, directory):
 
 class ProcessSession:
     """Own admission, process groups, temporary files and the machine lease."""
-    def __init__(self, state, profile='quiet', policy=None, monitor=None, lock_directory=None):
+    def __init__(self, state, profile='quiet', policy=None, monitor=None, lock_directory=None, *, layout=None, read_only=False):
         self.state = Path(state)
         self.profile = profile
         self.policy = policy or {}
+        self.layout = layout or {}
+        self.read_only = read_only
         self.monitor = monitor or Monitor(policy=self.policy)
         self.cancelled = threading.Event()
         self._processes = OwnedProcesses(self)
@@ -552,23 +564,43 @@ class ProcessSession:
         self.lock_directory = Path(lock_directory or Path.home() / '.cache/pocketbase-gate')
         self.directory = None
         self.lock = None
+        self.leases = []
+        self._receipts = None
+
+    @property
+    def receipts(self):
+        if self.read_only:
+            raise ValueError('File diagnostics cannot access release receipts')
+        if self._receipts is None:
+            self._receipts = ReceiptCache(self.state / self.layout.get('cache', 'cache'), self.content)
+            self._receipts.prune(self.policy.get('cacheBytes', CACHE_LIMIT))
+        return self._receipts
+
+    def acquire_lock(self, path):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        lease = path.open('a+')
+        try:
+            fcntl.flock(lease, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            print('Another verification owns ' + path.name + '; waiting...', flush=True)
+            fcntl.flock(lease, fcntl.LOCK_EX)
+        self.leases.append(lease)
+        return lease
 
     def __enter__(self):
         if platform.system() not in ('Darwin', 'Linux'):
             raise RuntimeError('Process supervision currently supports macOS and Linux')
         self.state.mkdir(parents=True, exist_ok=True)
-        self.lock_directory.mkdir(parents=True, exist_ok=True)
-        self.lock = (self.lock_directory / 'machine.lock').open('a+')
-        try:
-            fcntl.flock(self.lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            print('Another gate owns the machine lease; waiting...', flush=True)
-            fcntl.flock(self.lock, fcntl.LOCK_EX)
-        self.content = Content(self.state / 'content.json')
-        self.receipts = ReceiptCache(self.state / 'cache', self.content)
-        self.receipts.prune(self.policy.get('cacheBytes', CACHE_LIMIT))
-        self.directory = Path(tempfile.mkdtemp(prefix='run-', dir=self.state))
-        self.logs = self.state / 'logs' / self.directory.name
+        if self.layout.get('lock'):
+            self.lock = self.acquire_lock(self.state / self.layout['lock'])
+        if not self.read_only:
+            machine = self.acquire_lock(self.lock_directory / 'machine.lock')
+            self.lock = self.lock or machine
+        self.content = Content(None if self.read_only else self.state / self.layout.get('content', 'content.json'))
+        if not self.read_only:
+            self.receipts
+        self.directory = Path(tempfile.mkdtemp(prefix=self.layout.get('prefix', 'run-'), dir=self.state))
+        self.logs = self.state / self.layout.get('logs', 'logs') / self.directory.name
         self.logs.mkdir(parents=True)
         self.monitor.thread.start()
         for signum in (signal.SIGINT, signal.SIGTERM):
@@ -586,8 +618,11 @@ class ProcessSession:
     def environment(self, extra=None):
         temporary = self.directory / 'tmp'
         temporary.mkdir(exist_ok=True)
-        environment = dict(os.environ, TMPDIR=str(temporary), PBGATE_PROFILE=self.profile, **(extra or {}))
-        environment['BIMBA_NO_TYPECHECK_DAEMON'] = '1'
+        environment = dict(os.environ)
+        environment.update(extra or {})
+        environment.update(TMPDIR=str(temporary), PBGATE_PROFILE=self.profile)
+        if not self.read_only:
+            environment['BIMBA_NO_TYPECHECK_DAEMON'] = '1'
         return environment
 
     def spawn(self, command, cwd, log, env=None):
@@ -596,9 +631,8 @@ class ProcessSession:
             stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT)
 
     def stop(self, child):
-        self.stop_group(child.pid, self._processes.tokens.get(child.pid))
-        child.wait()
         self._processes.discard(child.pid)
+        child.wait()
 
     def check_resources(self, start=0):
         if self.cancelled.is_set():
@@ -620,7 +654,7 @@ class ProcessSession:
                     if pid:
                         child.returncode = os.waitstatus_to_exitcode(status)
                         break
-                    if time.monotonic() - start >= timeout:
+                    if timeout is not None and time.monotonic() - start >= timeout:
                         raise subprocess.TimeoutExpired(command, timeout)
                     self.cancelled.wait(.05)
             finally:
@@ -665,6 +699,9 @@ class ProcessSession:
                 os.killpg(group,signum)
             except ProcessLookupError:
                 pass
+            except PermissionError:
+                if signum == signal.SIGKILL and not finished():
+                    raise
             for pid in ProcessSession.tagged_processes(token):
                 try:
                     os.kill(pid,signum)
@@ -691,7 +728,6 @@ class ProcessSession:
         failures = []
         for group in set(self._processes.groups):
             try:
-                self.stop_group(group, self._processes.tokens.get(group))
                 self._processes.discard(group)
             except Exception as failure:
                 failures.append(failure)
@@ -703,12 +739,14 @@ class ProcessSession:
             self.monitor.done.set()
             self.monitor.thread.join(timeout=5)
             try:
-                self.receipts.prune(self.policy.get('cacheBytes', CACHE_LIMIT))
+                if self._receipts is not None:
+                    self._receipts.prune(self.policy.get('cacheBytes', CACHE_LIMIT))
                 shutil.rmtree(self.directory, ignore_errors=True)
             finally:
                 for signum, handler in self.previous_signals.items():
                     signal.signal(signum, handler)
-                self.lock.close()
+                for lease in reversed(self.leases):
+                    lease.close()
         if failures:
             raise RuntimeError('Process cleanup failed: ' + '; '.join(map(str, failures))) from failures[0]
 
@@ -823,12 +861,51 @@ class ReceiptCache:
             return False
 
 
+    def restore_manifest(self, stage, repo, command, parameters):
+        """Recover a prior dependency graph, never a verification verdict.
+
+        The executor still computes the exact current input key and validates
+        outputs before accepting any receipt. A missing/invalid graph stays
+        conservative; an importing file, helper, dependency or path addition
+        invalidates the old proof and the command discovers the new graph.
+        """
+        name = stage.get('source_manifest')
+        if not name or (Path(repo) / name).is_file():
+            return False
+        for directory, receipt in self.candidates(stage['name']):
+            if receipt.get('command') != command or receipt.get('parameters') != parameters:
+                continue
+            artifact = directory / 'artifacts' / name
+            if not receipt.get('outputs', {}).get(name) or self.content.file(artifact) != receipt['outputs'][name]:
+                continue
+            try:
+                metadata = json.loads(artifact.read_text())
+                expected = hashlib.sha256(json.dumps({'steps': stage.get('steps'), 'build': stage.get('build')}, separators=(',', ':')).encode()).hexdigest()
+                names = metadata['inputs']
+                if metadata.get('format') != 1 or metadata.get('recipe_hash') != expected or not names or any(not isinstance(path,str) or Path(path).is_absolute() or '..' in Path(path).parts for path in names):
+                    continue
+                target = Path(repo) / name
+                if not target.resolve().is_relative_to(Path(repo).resolve()):
+                    continue
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(artifact, target)
+                return True
+            except (OSError, ValueError, KeyError, TypeError):
+                continue
+        return False
+
     def invalidate(self, key):
         (self.directory / key / 'receipt.json').unlink(missing_ok=True)
         with self._candidate_lock:
             if self._candidates is not None:
                 for entries in self._candidates.values():
                     entries[:] = [(path, value) for path, value in entries if path.name != key]
+
+    @contextmanager
+    def artifact_transaction(self):
+        with self._artifact_lock, (self.directory / '.artifacts.lock').open('a+') as lease:
+            fcntl.flock(lease, fcntl.LOCK_EX)
+            yield
 
     def directory_inventory(self, directory):
         result = {}
@@ -840,7 +917,7 @@ class ReceiptCache:
         return result
 
     def restore_directory(self, key, destination):
-        with self._artifact_lock:
+        with self.artifact_transaction():
             entry = self.directory / key
             copying = False
             try:
@@ -867,7 +944,7 @@ class ReceiptCache:
                 return None
 
     def save_directory(self, key, source, metadata, temporary):
-        with self._artifact_lock:
+        with self.artifact_transaction():
             outputs = self.directory_inventory(source)
             temporary = Path(temporary)
             temporary.mkdir(mode=0o700)

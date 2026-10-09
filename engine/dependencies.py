@@ -14,9 +14,9 @@ class DependencyGraph:
         self.project, self.session = project, session
         self.descriptors = {}
 
-    def graph(self, outdir='public', observations=None):
+    def graph(self, outdir='public', observations=None, manifest='.pbgate-dependencies.json'):
         root, content = self.project.root, self.session.content
-        path = root / outdir / '.pbgate-dependencies.json'
+        path = root / outdir / manifest
         content.file(path, observations)
         graph = json.loads(path.read_text())
         sources = content.common_inventory(root, [graph['sources']], observations)
@@ -59,12 +59,14 @@ class DependencyGraph:
                 selected.add(name)
                 pending.append(name)
         result = {name:value for name,value in sources.items() if name in selected or name not in modules}
+        for name in selected:
+            if mode == 'models' or name not in hooks:
+                result[name] = digest([sources[name], modules[name]['output_hash']])
         for hook in [] if mode == 'models' else hooks:
             module = modules[hook]
-            hashes = [module['startup_hash'], *(route['hash'] for route in module.get('routes', []) if matches(route))]
-            if any(not isinstance(value, str) or len(value) != 64 for value in hashes):
-                raise ValueError('Missing executable scope hash')
-            result[hook] = digest(hashes)
+            hashes = [module.get('startup_hash'), *(route.get('hash') for route in module.get('routes', []) if matches(route))]
+            if all(isinstance(value, str) and len(value) == 64 for value in hashes):
+                result[hook] = digest(hashes)
         result['sourceStructure'] = digest(sorted(sources))
         return result
 
@@ -135,16 +137,73 @@ class DependencyGraph:
         except (OSError, ValueError, KeyError, TypeError, AttributeError):
             return {'files':{}, 'sources':None, 'outdir':None, 'scope':'full'}
 
-    def preparation(self, outdir, observations=None):
+    def preparation(self, outdir, observations=None, manifest='.pbgate-dependencies.json'):
         content, root = self.session.content, self.project.root
         complete = content.inventory(root, [outdir], observations)
         try:
-            graph, sources = self.graph(outdir, observations)
+            graph, sources = self.graph(outdir, observations, manifest)
             selected = self.select(graph, sources, {'routes':[], 'mode':'routes'})
             outputs = {module['output'] for module in graph['modules'].values()}
             if {name for name in complete if name.endswith('.js')} != outputs:
                 return complete
-            assets = {name:value for name,value in complete.items() if name not in outputs and name != outdir + '/.pbgate-dependencies.json'}
+            assets = {name:value for name,value in complete.items() if name not in outputs and name != outdir + '/' + manifest}
             return dict(selected, **assets)
         except (OSError, ValueError, KeyError, TypeError, AttributeError):
             return complete
+
+
+class CatalogDependencies:
+    """Catalog facade over the same complete compiler graph used by Gate."""
+    @staticmethod
+    def inputs(content, repo, policy, observations=None, *, manifest='.pbgate-dependencies.json'):
+        from types import SimpleNamespace
+        sources = content.common_inventory(repo, [policy.get('sources', 'src')], observations)
+        fallback = lambda: dict(sources, backend_dependency_scope='full')
+        try:
+            graph_owner = DependencyGraph(SimpleNamespace(root=repo), SimpleNamespace(content=content))
+            graph, sources = graph_owner.graph(policy.get('outdir', 'public'), observations, manifest)
+            result = graph_owner.select(graph, sources, policy)
+            outputs = content.inventory(repo, [graph['outdir']], observations)
+            if {name for name in outputs if name.endswith('.js')} != {module['output'] for module in graph['modules'].values()}:
+                return fallback()
+            assets = {name:value for name,value in outputs.items() if not name.endswith('.js') and name != graph['outdir'] + '/' + manifest}
+            result.update(assets)
+            result['backend_source_structure'] = result.pop('sourceStructure')
+            result['backend_dependency_scope'] = digest(policy)
+            return result
+        except (OSError, ValueError, KeyError, TypeError, AttributeError):
+            return fallback()
+
+    @staticmethod
+    def model_inputs(content, repo, stage, observations=None, *, settings=None):
+        settings = settings or {}
+        fallback = lambda: dict(content.common_inventory(repo, settings.get('fallback', ['src','scripts','test','tests','pb_migrations']), observations), backend_model_scope='full')
+        try:
+            path = repo / settings.get('model_manifest', '.cache/pbgate/model-dependencies.json')
+            metadata_hash = content.file(path, observations)
+            manifests = getattr(content, '_model_manifests', {})
+            if metadata_hash not in manifests:
+                manifests[metadata_hash] = json.loads(path.read_text())
+                content._model_manifests = manifests
+            manifest = manifests[metadata_hash]
+            implementation = [content.file(Path(__file__).resolve().parents[1] / 'src' / name, observations) for name in ('dependencies.js','dependency-scan.js')]
+            implementation.extend(content.file(repo / name, observations) for name in settings.get('tooling', []))
+            if manifest['format'] != 2 or manifest['implementation'] != implementation:
+                return fallback()
+            declared, roots = {}, set()
+            for test in stage['tests']:
+                check = manifest['checks'][test]
+                if (check['tests'] != [test] or check['opaque'] is not False
+                        or set(check.get('external_inputs', [])) - set(stage.get('external_inputs', []))
+                        or any(Path(name).is_absolute() or '..' in Path(name).parts for name in check['files'])):
+                    return fallback()
+                declared.update(check['files'])
+                roots.update(check['roots'])
+            files = content.inventory(repo, list(declared), observations)
+            if files != declared:
+                return fallback()
+            result = CatalogDependencies.inputs(content, repo, {'routes': [], 'roots':sorted(roots), 'mode':'models'}, observations,
+                    manifest=settings.get('compiler_manifest', '.pbgate-dependencies.json'))
+            return dict(result, **files, backend_model_implementation=digest(implementation))
+        except (OSError, ValueError, KeyError, TypeError, AttributeError):
+            return fallback()

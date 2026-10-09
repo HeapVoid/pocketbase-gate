@@ -18,6 +18,7 @@ import time
 
 from runtime import Content, ProcessSession, ReceiptCache, PROFILES, atomic_json
 from dependencies import DependencyGraph
+from catalog import access_conflict
 
 INTENTS = {'dev', 'release', 'diagnostic'}
 DEFAULT_INPUTS = ['src', 'test', 'tests', 'scripts', 'package.json', 'bun.lock',
@@ -399,11 +400,7 @@ class Gate:
 
     @staticmethod
     def conflicts(first, second):
-        for left, rights in [(item, second.writes + second.reads) for item in first.writes] + [(item, first.reads) for item in second.writes]:
-            for right in rights:
-                if left == right or left.startswith(right + '/') or right.startswith(left + '/'):
-                    return True
-        return False
+        return access_conflict(first.reads, first.writes, second.reads, second.writes)
 
     def run(self):
         start = time.monotonic()
@@ -479,6 +476,26 @@ def main():
     parser.add_argument('--release', action='store_true')
     parser.add_argument('--force', action='store_true')
     args = parser.parse_args()
+    document = json.loads(Path(args.config).read_text())
+    if document.get('format') == 2:
+        import importlib.util
+        name = '_pbgate_cli_sdk'
+        entrypoint = Path(__file__).with_name('__init__.py')
+        spec = importlib.util.spec_from_file_location(name, entrypoint, submodule_search_locations=[str(entrypoint.parent)])
+        sdk = importlib.util.module_from_spec(spec)
+        sys.modules[name] = sdk
+        spec.loader.exec_module(sdk)
+        project = sdk.CatalogProject(args.config)
+        plan = project.plan_catalog.plan(args.intent, args.check, args.domain)
+        if args.action == 'plan':
+            print(json.dumps(plan.describe(), indent=2))
+            return 0
+        if args.intent == 'release' and not args.release:
+            parser.error('Release execution requires --release')
+        if args.force and not args.release:
+            parser.error('--force requires explicit --release')
+        with sdk.CatalogSession(project.state, args.profile, protocol=document.get('worker_protocol'), policy=document.get('resources')) as owned:
+            return sdk.CatalogGate(project).verify(project.root, project.component, owned, args.force, plan=plan)
     project = Project.read(args.config)
     plan = project.plan(args.intent, args.check, args.domain)
     if args.action == 'plan':

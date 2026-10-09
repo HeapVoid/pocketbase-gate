@@ -10,6 +10,8 @@ bun add --dev pocketbase-gate
 
 Runtime requirements: macOS or Linux, Node 20+ and Python 3.9+. Imba compilation additionally uses Bun and the consumer's installed `bimba-cli`. PocketBase fixtures use an explicitly configured local binary (native controls are tested on PocketBase 0.40.4). The package never downloads a binary or starts an application server automatically.
 
+Advanced workspaces can use [catalogs with automatic file leaves and lifecycle workers](docs/catalogs.md). The same installed engine provides the Python integration, exact dependency scanner and stopped-fixture artifact store.
+
 ## Declare checks
 
 Create `pbgate.json` in the project root:

@@ -3,12 +3,13 @@ import {realpathSync} from 'node:fs';
 import {createHash} from 'node:crypto';
 import {createRequire} from 'node:module';
 import {posix, resolve} from 'node:path';
+import {fileURLToPath} from 'node:url';
 import {inspectModelDependencies} from './dependencies.js';
 
-const request = JSON.parse(await readFile(process.argv[2], 'utf8'));
+export async function scanDependencies(request) {
 const {root, graph} = request;
 const hash = bytes => createHash('sha256').update(bytes).digest('hex');
-const seen = new Set(), roots = new Set(), files = {};
+const seen = new Set(), roots = new Set(), externals = new Set(), files = {};
 let opaque = !request.files.length;
 const visit = async name => {
   if (seen.has(name)) return;
@@ -18,6 +19,7 @@ const visit = async name => {
   try {bytes=await readFile(resolve(root,name));}
   catch (error) {if (error.code!=='ENOENT') throw error;opaque=true;return;}
   files[name]=hash(bytes);
+  if(request.externalFiles?.[name]) {for(const owner of request.externalFiles[name])externals.add(owner);return;}
   if (!/\.(?:[cm]?js|ts)$/.test(name)) return;
   const require=createRequire(resolve(root,name));
   const installed=path => {
@@ -46,4 +48,10 @@ const visit = async name => {
   }
 };
 for (const file of request.files) await visit(file);
-await writeFile(request.output,JSON.stringify({roots:[...roots].sort(),files,opaque}));
+return {tests:request.files,roots:[...roots].sort(),files,external_inputs:[...externals].sort(),opaque};
+}
+if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  const request = JSON.parse(await readFile(process.argv[2], 'utf8'));
+  await writeFile(request.output,JSON.stringify(await scanDependencies(request)));
+}
+export const dependencyImplementation = [new URL('./dependencies.js',import.meta.url),new URL('./dependency-scan.js',import.meta.url)];

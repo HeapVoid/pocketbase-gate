@@ -1,6 +1,6 @@
 {
   "name": "pocketbase-gate",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "description": "Resource-aware verification gates and isolated test fixtures for PocketBase and Imba",
   "type": "module",
   "bin": {
@@ -9,7 +9,10 @@
   "exports": {
     ".": "./src/context.js",
     "./imba": "./src/imba.js",
-    "./dependencies": "./src/dependencies.js"
+    "./dependencies": "./src/dependencies.js",
+    "./python": "./src/python.js",
+    "./dependency-scan": "./src/dependency-scan.js",
+    "./templates": "./src/templates.js"
   },
   "files": [
     "bin",
