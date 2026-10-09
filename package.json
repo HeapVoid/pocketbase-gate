@@ -1,6 +1,6 @@
 {
   "name": "pocketbase-gate",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "description": "Resource-aware verification gates and isolated test fixtures for PocketBase and Imba",
   "type": "module",
   "bin": {

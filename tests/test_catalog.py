@@ -80,3 +80,14 @@ class CatalogTests(unittest.TestCase):
         self.config.write_text(self.config.read_text() + ' ')
         with self.assertRaisesRegex(RuntimeError,'catalog changed'):
             plan.assert_current()
+
+    def test_a_test_added_during_execution_cannot_receive_a_complete_gate_stamp(self):
+        runner = self.root / 'runner.py'
+        runner.write_text(runner.read_text()+"Path('test/c.py').write_text('valid new c')\n")
+        code, report = self.run_catalog()
+        self.assertNotEqual(code,0)
+        self.assertFalse(report['passed'])
+        self.assertIn('inventory changed',report['plan_changed'])
+        self.assertFalse((self.root / '.pbgate/results/example.json').exists())
+        runner.write_text(runner.read_text().replace("Path('test/c.py').write_text('valid new c')\n",''))
+        self.assertEqual(self.run_catalog()[0],0)

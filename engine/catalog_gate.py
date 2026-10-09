@@ -270,6 +270,13 @@ class CatalogGate:
             report['completed'] = datetime.now(timezone.utc).isoformat()
             checked = checkpoint.finish()
             report['snapshot'], stable = checked['snapshot'], checked['stable']
+            if plan is not None:
+                try:
+                    plan.assert_current()
+                except (RuntimeError, OSError) as error:
+                    code = code or 2
+                    report['plan_changed'] = str(error)
+                    print(str(error), file=sys.stderr)
             if not stable:
                 code = code or 2
                 report['changed_inputs'] = checked['changed_inputs']
