@@ -1,0 +1,20 @@
+{
+  "name": "pocketbase-gate",
+  "version": "0.1.0",
+  "description": "Resource-aware verification gates and isolated test fixtures for PocketBase and Imba",
+  "type": "module",
+  "bin": { "pbgate": "bin/pbgate.js" },
+  "exports": { ".": "./src/context.js", "./imba": "./src/imba.js" },
+  "files": ["bin", "engine", "src", "docs", "schema.json", "README.md", "LICENSE"],
+  "engines": { "node": ">=20" },
+  "scripts": {
+    "test": "python3 -m unittest discover -s tests -p 'test_*.py'",
+    "test:client": "node --test tests/context.test.js",
+    "test:native": "python3 -m unittest discover -s tests -p 'native_*.py'"
+  },
+  "repository": { "type": "git", "url": "git+https://github.com/HeapVoid/pocketbase-gate.git" },
+  "bugs": { "url": "https://github.com/HeapVoid/pocketbase-gate/issues" },
+  "homepage": "https://github.com/HeapVoid/pocketbase-gate#readme",
+  "keywords": ["pocketbase", "imba", "bimba", "testing", "gate"],
+  "license": "MIT"
+}

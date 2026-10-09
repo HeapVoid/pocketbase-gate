@@ -1,0 +1,14 @@
+{
+  "format": 1,
+  "checks": [
+    {
+      "id": "sum",
+      "command": ["node", "sum.test.js"],
+      "inputs": ["sum.test.js"],
+      "tests": ["sum.test.js"],
+      "domains": ["math"]
+    }
+  ],
+  "testInventory": ["*.test.js"],
+  "required": ["sum"]
+}

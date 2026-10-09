@@ -1,0 +1,8 @@
+node_modules/
+.pbgate/
+__pycache__/
+*.pyc
+*.tgz
+.DS_Store
+.env*
+!.env.example

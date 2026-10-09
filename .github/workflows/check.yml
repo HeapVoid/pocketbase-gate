@@ -1,0 +1,42 @@
+name: Verify package
+on: [push, pull_request]
+permissions:
+  contents: read
+concurrency:
+  group: check-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+          package-manager-cache: false
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+      - uses: oven-sh/setup-bun@v2
+      - run: npm test
+      - run: npm run test:client
+      - name: Prepare disposable native test tools
+        run: |
+          python3 - <<'PY'
+          import urllib.request, zipfile, io, os
+          url = 'https://github.com/pocketbase/pocketbase/releases/download/v0.40.4/pocketbase_0.40.4_linux_amd64.zip'
+          content = urllib.request.urlopen(url).read()
+          with zipfile.ZipFile(io.BytesIO(content)) as archive:
+              with open('/tmp/pbgate-pocketbase', 'wb') as output:
+                  output.write(archive.read('pocketbase'))
+          os.chmod('/tmp/pbgate-pocketbase', 0o755)
+          PY
+          mkdir -p /tmp/pbgate-compiler
+          cd /tmp/pbgate-compiler
+          bun add --dev bimba-cli@0.7.50 imba@2.0.0-alpha.253
+      - name: Verify native isolation and Imba consumer
+        env:
+          PBGATE_TEST_BINARY: /tmp/pbgate-pocketbase
+          PBGATE_TEST_BIMBA: /tmp/pbgate-compiler/node_modules/bimba-cli
+        run: npm run test:native
+      - run: npm pack --dry-run

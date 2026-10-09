@@ -1,0 +1,256 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "PocketBase Gate configuration",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "format",
+    "checks"
+  ],
+  "properties": {
+    "format": {
+      "const": 1
+    },
+    "state": {
+      "type": "string",
+      "default": ".pbgate"
+    },
+    "resources": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "minIdlePercent": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 100
+        },
+        "maxSwapBytesPerSecond": {
+          "type": "number",
+          "minimum": 0
+        },
+        "admissionTimeoutSeconds": {
+          "type": "number",
+          "minimum": 0.01,
+          "maximum": 86400
+        },
+        "maxMemoryBytes": {
+          "type": "number",
+          "minimum": 1
+        },
+        "cacheBytes": {
+          "type": "number",
+          "minimum": 1
+        }
+      }
+    },
+    "checks": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "id",
+          "command"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]*$"
+          },
+          "command": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "minLength": 1
+            },
+            "minItems": 1
+          },
+          "inputs": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "minLength": 1
+            }
+          },
+          "inputSets": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "minLength": 1
+            }
+          },
+          "outputs": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "minLength": 1
+            }
+          },
+          "requires": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "minLength": 1
+            }
+          },
+          "domains": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "minLength": 1
+            }
+          },
+          "tests": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "minLength": 1
+            }
+          },
+          "exclusive": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "minLength": 1
+            }
+          },
+          "intents": {
+            "type": "array",
+            "minItems": 1,
+            "items": {
+              "enum": [
+                "dev",
+                "release",
+                "diagnostic"
+              ]
+            }
+          },
+          "kind": {
+            "enum": [
+              "test",
+              "prepare"
+            ]
+          },
+          "fixture": {
+            "type": "string"
+          },
+          "isolation": {
+            "enum": [
+              "fresh",
+              "shared"
+            ]
+          },
+          "timeoutSeconds": {
+            "type": "number",
+            "minimum": 0.01,
+            "maximum": 86400
+          },
+          "cache": {
+            "type": "boolean"
+          },
+          "restore": {
+            "type": "boolean"
+          },
+          "env": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "string"
+            }
+          }
+        }
+      }
+    },
+    "fixtures": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "binary"
+        ],
+        "properties": {
+          "binary": {
+            "type": "string",
+            "minLength": 1
+          },
+          "hooks": {
+            "type": "string"
+          },
+          "migrations": {
+            "type": "string"
+          },
+          "inputs": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "minLength": 1
+            }
+          },
+          "seed": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "minLength": 1
+            },
+            "minItems": 1
+          },
+          "nativeStoreKeys": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "minLength": 1
+            }
+          },
+          "env": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "string"
+            }
+          },
+          "startupTimeoutSeconds": {
+            "type": "number",
+            "minimum": 0.01,
+            "maximum": 86400
+          },
+          "hooksPool": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 64
+          }
+        }
+      }
+    },
+    "inputSets": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "array",
+        "items": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "required": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
+    },
+    "testInventory": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
+    },
+    "tools": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
+    }
+  }
+}
