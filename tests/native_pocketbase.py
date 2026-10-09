@@ -3,6 +3,7 @@ import os
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import patch
 from support import ROOT, session
 from gate import Project, Gate
 
@@ -31,6 +32,11 @@ class NativePocketBaseTests(unittest.TestCase):
             code = Gate(project, project.plan(), owned).run()
             report = json.loads((owned.logs / 'report.json').read_text())
         return code, report
+
+    def test_disposable_superuser_password_is_never_parsed_as_a_cli_flag(self):
+        with patch('pocketbase.secrets.token_urlsafe',return_value='-a-disposable-test-password'):
+            code, report = self.run_gate([self.check('password', "assert.equal((await context.request('/api/collections/notes/records')).totalItems,0);")])
+        self.assertEqual(code,0,report)
 
     def test_shared_fixture_restores_records_store_and_storage(self):
         (self.root / 'hooks').mkdir()

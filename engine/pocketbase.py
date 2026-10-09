@@ -107,8 +107,8 @@ class PocketBaseFixture:
         if metadata:
             self.password = metadata['password']
         else:
-            for args in (['migrate', 'up'], ['superuser', 'upsert', 'admin@pbgate.test', self.password]):
-                code, _ = session.run([binary, *args, *paths], self.project.root, preparation_log,
+            for args in (['migrate', 'up', *paths], ['superuser', 'upsert', *paths, '--', 'admin@pbgate.test', self.password]):
+                code, _ = session.run([binary, *args], self.project.root, preparation_log,
                     self.environment, remaining(), admission=False)
                 if code:
                     raise RuntimeError('PocketBase preparation failed; see ' + str(preparation_log))
